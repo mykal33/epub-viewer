@@ -10,6 +10,7 @@
   <!-- html2canvas & jsPDF for direct 1-click PDF download -->
   <script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
+  <style id="epubEmbeddedFonts"></style>
   <style>
     :root {
       --bg: #f8f9fa;
@@ -385,6 +386,240 @@
       }
     }
 
+    // Inline all external/blob stylesheets and @font-face rules with Base64 data URLs
+    async function inlineAllStylesAndFonts(doc) {
+      const collectedFontRules = [];
+      let allCssText = '';
+
+      for (const sheet of Array.from(doc.styleSheets)) {
+        try {
+          for (const rule of Array.from(sheet.cssRules || [])) {
+            let css = rule.cssText;
+            const urlMatches = [...css.matchAll(/url\(["']?(blob:[^"')]+)["']?\)/g)];
+            for (const m of urlMatches) {
+              try {
+                const resp = await fetch(m[1]);
+                const blob = await resp.blob();
+                const dataUrl = await new Promise((resolve) => {
+                  const reader = new FileReader();
+                  reader.onloadend = () => resolve(reader.result);
+                  reader.readAsDataURL(blob);
+                });
+                css = css.replace(m[1], dataUrl);
+              } catch (e) {}
+            }
+            allCssText += css + '\n';
+            if (rule.type === CSSRule.FONT_FACE_RULE || css.startsWith('@font-face')) {
+              collectedFontRules.push(css);
+            }
+          }
+        } catch (e) {}
+      }
+
+      if (collectedFontRules.length > 0) {
+        const joined = collectedFontRules.join('\n');
+        const hostFontStyle = document.getElementById('epubEmbeddedFonts');
+        if (hostFontStyle && hostFontStyle.textContent !== joined) {
+          hostFontStyle.textContent = joined;
+        }
+        const iframeFontStyle = doc.createElement('style');
+        iframeFontStyle.textContent = joined;
+        doc.head.appendChild(iframeFontStyle);
+        if (document.fonts && document.fonts.ready) await document.fonts.ready;
+        if (doc.fonts && doc.fonts.ready) await doc.fonts.ready;
+      }
+
+      return allCssText;
+    }
+
+    // Native Browser SVG foreignObject Renderer: captures the exact browser layout (exact fonts,
+    // rotated/scaled letters, and fixed coordinates) 1:1 with the viewer!
+    async function captureViaNativeForeignObject(doc, pageW, pageH, allCssText) {
+      try {
+        const htmlClone = doc.documentElement.cloneNode(true);
+        // Remove external <link> tags (already inlined into allCssText) & <script> tags
+        htmlClone.querySelectorAll('link[rel="stylesheet"], script').forEach(el => el.remove());
+
+        const inlinedStyle = doc.createElement('style');
+        inlinedStyle.textContent = allCssText;
+        (htmlClone.querySelector('head') || htmlClone).appendChild(inlinedStyle);
+
+        htmlClone.setAttribute('xmlns', 'http://www.w3.org/1999/xhtml');
+        htmlClone.style.width = pageW + 'px';
+        htmlClone.style.height = pageH + 'px';
+        htmlClone.style.margin = '0';
+        htmlClone.style.padding = '0';
+        htmlClone.style.overflow = 'hidden';
+
+        const xhtmlStr = new XMLSerializer().serializeToString(htmlClone);
+        const svgStr = `<svg xmlns="http://www.w3.org/2000/svg" width="${pageW}" height="${pageH}" viewBox="0 0 ${pageW} ${pageH}">
+          <foreignObject x="0" y="0" width="100%" height="100%">${xhtmlStr}</foreignObject>
+        </svg>`;
+
+        const svgDataUrl = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svgStr);
+        const img = new Image();
+        img.width = pageW * 2;
+        img.height = pageH * 2;
+
+        await new Promise((resolve, reject) => {
+          img.onload = () => resolve();
+          img.onerror = (err) => reject(err);
+          img.src = svgDataUrl;
+        });
+
+        const canvas = document.createElement('canvas');
+        canvas.width = pageW * 2;
+        canvas.height = pageH * 2;
+        const ctx = canvas.getContext('2d');
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+
+        if (!isCanvasBlank(canvas)) {
+          return canvas;
+        }
+      } catch (e) {
+        console.warn('Native foreignObject capture fell back to html2canvas:', e);
+      }
+      return null;
+    }
+
+    // Rasterize inline <svg> elements using the browser's native SVG renderer
+    async function rasterizeInlineSvgs(doc) {
+      const svgs = Array.from(doc.querySelectorAll('svg'));
+      if (svgs.length === 0) return;
+
+      let styleText = '';
+      for (const sheet of Array.from(doc.styleSheets)) {
+        try {
+          for (const rule of Array.from(sheet.cssRules || [])) {
+            styleText += rule.cssText + '\n';
+          }
+        } catch (e) {}
+      }
+
+      for (const svg of svgs) {
+        const rect = svg.getBoundingClientRect();
+        const vb = svg.getAttribute('viewBox');
+        let w = Math.round(rect.width);
+        let h = Math.round(rect.height);
+
+        if ((!w || !h) && vb) {
+          const parts = vb.trim().split(/[\s,]+/).map(Number);
+          if (parts.length === 4) {
+            w = parts[2];
+            h = parts[3];
+          }
+        }
+        if (!w || !h) continue;
+
+        try {
+          const clone = svg.cloneNode(true);
+          clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
+          clone.setAttribute('width', w);
+          clone.setAttribute('height', h);
+
+          if (styleText) {
+            const styleEl = doc.createElementNS('http://www.w3.org/2000/svg', 'style');
+            styleEl.textContent = styleText;
+            clone.insertBefore(styleEl, clone.firstChild);
+          }
+
+          const svgXml = new XMLSerializer().serializeToString(clone);
+          const svgBlob = new Blob([svgXml], { type: 'image/svg+xml;charset=utf-8' });
+          const url = URL.createObjectURL(svgBlob);
+
+          const imgEl = doc.createElement('img');
+          imgEl.width = w;
+          imgEl.height = h;
+          imgEl.style.width = w + 'px';
+          imgEl.style.height = h + 'px';
+
+          await new Promise((resolve) => {
+            imgEl.onload = () => resolve();
+            imgEl.onerror = () => resolve();
+            imgEl.src = url;
+          });
+
+          const c = document.createElement('canvas');
+          c.width = w * 2;
+          c.height = h * 2;
+          const ctx = c.getContext('2d');
+          ctx.drawImage(imgEl, 0, 0, w * 2, h * 2);
+          URL.revokeObjectURL(url);
+
+          const pngUrl = c.toDataURL('image/png');
+          const finalImg = doc.createElement('img');
+          finalImg.src = pngUrl;
+          finalImg.style.width = w + 'px';
+          finalImg.style.height = h + 'px';
+          finalImg.style.maxWidth = '100%';
+          finalImg.style.display = 'block';
+          finalImg.style.margin = '0 auto';
+
+          svg.parentNode.replaceChild(finalImg, svg);
+        } catch (err) {
+          console.warn('SVG rasterization fallback:', err);
+        }
+      }
+    }
+
+    // Safe overlap guard for html2canvas fallback: NEVER pushes single-letter spans apart!
+    function fixOverlappingTextSpans(doc) {
+      doc.querySelectorAll('h1, h2, h3, h4, p, div, span').forEach(el => {
+        const cs = doc.defaultView.getComputedStyle(el);
+        const ls = parseFloat(cs.letterSpacing);
+        const ws = parseFloat(cs.wordSpacing);
+        if (!isNaN(ls) && ls < -1) {
+          el.style.setProperty('letter-spacing', 'normal', 'important');
+        }
+        if (!isNaN(ws) && ws < -2) {
+          el.style.setProperty('word-spacing', 'normal', 'important');
+        }
+      });
+
+      // Only adjust multi-character word spans (length > 1) that actually overlap horizontally;
+      // leave single-character stylized lettering (e.g. "FIGURES IT OUT!") untouched!
+      const absWordEls = Array.from(doc.querySelectorAll('span, p, div')).filter(el => {
+        if (el.children.length > 0) return false;
+        const txt = (el.textContent || '').trim();
+        if (txt.length <= 1) return false;
+        const cs = doc.defaultView.getComputedStyle(el);
+        return cs.position === 'absolute' && cs.transform === 'none';
+      });
+
+      if (absWordEls.length > 1) {
+        const lines = [];
+        for (const el of absWordEls) {
+          const rect = el.getBoundingClientRect();
+          if (rect.width <= 0 || rect.height <= 0) continue;
+          let line = lines.find(l => Math.abs(l.top - rect.top) < 5);
+          if (!line) {
+            line = { top: rect.top, items: [] };
+            lines.push(line);
+          }
+          line.items.push(el);
+        }
+
+        for (const line of lines) {
+          line.items.sort((a, b) => a.getBoundingClientRect().left - b.getBoundingClientRect().left);
+          for (let i = 0; i < line.items.length - 1; i++) {
+            const cur = line.items[i];
+            const nxt = line.items[i + 1];
+            const r1 = cur.getBoundingClientRect();
+            const r2 = nxt.getBoundingClientRect();
+            if (r2.left < r1.right - 1) {
+              const fontSizePx = parseFloat(doc.defaultView.getComputedStyle(cur).fontSize) || 14;
+              const gap = Math.max(2, Math.round(fontSizePx * 0.2));
+              const shift = (r1.right + gap) - r2.left;
+              const currentLeft = parseFloat(doc.defaultView.getComputedStyle(nxt).left) || r2.left;
+              nxt.style.setProperty('left', (currentLeft + shift) + 'px', 'important');
+            }
+          }
+        }
+      }
+    }
+
     function isCanvasBlank(canvas) {
       if (!canvas || canvas.width === 0 || canvas.height === 0) return true;
       const ctx = canvas.getContext('2d');
@@ -397,11 +632,9 @@
       return true;
     }
 
-    // Collect exact vertical bounds (in 2x canvas pixels) of all media, headings+next line, and text lines
     function collectAtomicBoxes(doc, scale = 2) {
       const boxes = [];
 
-      // 1. Protect images, figures, tables
       doc.querySelectorAll('img, svg, figure, table').forEach(el => {
         const target = el.closest('figure') || el;
         const rect = target.getBoundingClientRect();
@@ -413,7 +646,6 @@
         }
       });
 
-      // 2. Keep every heading attached to the start of its following paragraph/item
       doc.querySelectorAll('h1, h2, h3, h4, h5, h6').forEach(h => {
         const hRect = h.getBoundingClientRect();
         if (hRect.height <= 0) return;
@@ -435,7 +667,6 @@
         });
       });
 
-      // 3. Protect every visual line of text (and keep 2-line short paragraphs together)
       doc.querySelectorAll('p, li, blockquote, dd, dt, h1, h2, h3, h4').forEach(block => {
         const lineRects = [];
         const walker = doc.createTreeWalker(block, NodeFilter.SHOW_TEXT, null);
@@ -529,7 +760,7 @@
         manager: 'default'
       });
 
-      const effectiveFontSize = isPrePaginated ? fontSize : Math.round(fontSize * 1.3);
+      const effectiveFontSize = isPrePaginated ? fontSize : Math.round(fontSize * 1.25);
       exportRendition.themes.fontSize(effectiveFontSize + '%');
 
       const spineItems = exportBook.spine.spineItems;
@@ -549,6 +780,7 @@
           if (!iframe || !iframe.contentDocument || !iframe.contentDocument.body) continue;
 
           let doc = iframe.contentDocument;
+          await inlineAllStylesAndFonts(doc);
           await inlineBlobImages(doc);
 
           const fixedDims = detectFixedDimensions(doc);
@@ -569,21 +801,29 @@
             iframe = pdfStage.querySelector('iframe');
             if (!iframe || !iframe.contentDocument || !iframe.contentDocument.body) continue;
             doc = iframe.contentDocument;
+            const allCssText = await inlineAllStylesAndFonts(doc);
             await inlineBlobImages(doc);
-            const activeBody = doc.body;
 
-            const canvas = await html2canvas(activeBody, {
-              scale: 2,
-              useCORS: true,
-              allowTaint: true,
-              backgroundColor: '#ffffff',
-              x: 0,
-              y: 0,
-              width: pageW,
-              height: pageH,
-              windowWidth: pageW,
-              windowHeight: pageH
-            });
+            // 1. Try Native Browser SVG foreignObject capture first (100% identical to preview!)
+            let canvas = await captureViaNativeForeignObject(doc, pageW, pageH, allCssText);
+
+            // 2. Fallback to html2canvas if foreignObject wasn't supported on this page
+            if (!canvas) {
+              await rasterizeInlineSvgs(doc);
+              fixOverlappingTextSpans(doc);
+              canvas = await html2canvas(doc.body, {
+                scale: 2,
+                useCORS: true,
+                allowTaint: true,
+                backgroundColor: '#ffffff',
+                x: 0,
+                y: 0,
+                width: pageW,
+                height: pageH,
+                windowWidth: pageW,
+                windowHeight: pageH
+              });
+            }
 
             if (isCanvasBlank(canvas)) continue;
 
@@ -598,14 +838,12 @@
           } else {
             // Reflowable chapter book
             const activeBody = doc.body;
-            const imgs = doc.querySelectorAll('img');
-            const svgs = doc.querySelectorAll('svg');
+            const initialImgs = doc.querySelectorAll('img');
+            const initialSvgs = doc.querySelectorAll('svg');
             const textLen = (activeBody.innerText || '').trim().length;
 
-            // Detect Cover Page, Title Page graphic, or Back Cover
-            const isFullArtworkPage = ((imgs.length === 1 && svgs.length === 0) || (svgs.length === 1 && imgs.length === 0)) && textLen < 45;
+            const isFullArtworkPage = ((initialImgs.length === 1 && initialSvgs.length === 0) || (initialSvgs.length === 1 && initialImgs.length === 0)) && textLen < 45;
 
-            // Enforce clean margins & normal unbolded body font for hyperlinks via !important stylesheet
             const overrideStyle = doc.createElement('style');
             overrideStyle.textContent = `
               html, body {
@@ -650,8 +888,8 @@
               activeBody.style.alignItems = 'center';
               activeBody.style.justifyContent = 'center';
 
-              if (imgs.length === 1) {
-                const img = imgs[0];
+              if (initialImgs.length === 1) {
+                const img = initialImgs[0];
                 const natW = img.naturalWidth || availW;
                 const natH = img.naturalHeight || availH;
                 const ratio = Math.min(availW / natW, availH / natH);
@@ -662,8 +900,8 @@
                 img.style.setProperty('height', fitH + 'px', 'important');
                 img.style.setProperty('max-width', 'none', 'important');
                 img.style.setProperty('max-height', 'none', 'important');
-              } else if (svgs.length === 1) {
-                const svg = svgs[0];
+              } else if (initialSvgs.length === 1) {
+                const svg = initialSvgs[0];
                 svg.style.setProperty('width', availW + 'px', 'important');
                 svg.style.setProperty('height', availH + 'px', 'important');
               }
@@ -697,7 +935,11 @@
               continue;
             }
 
-            // Force generous top, side, and bottom margins with !important so EPUB CSS cannot zero them out
+            await rasterizeInlineSvgs(doc);
+            fixOverlappingTextSpans(doc);
+
+            const imgs = doc.querySelectorAll('img');
+
             const sidePad = 44;
             const topBodyPad = 60;
             activeBody.style.setProperty('padding', `${topBodyPad}px ${sidePad}px 48px ${sidePad}px`, 'important');
@@ -705,7 +947,6 @@
             activeBody.style.columnCount = 'auto';
             activeBody.style.columnWidth = 'auto';
 
-            // Clamp inline & floated images to their container's available width
             const maxInlineH = Math.round(REFLOW_H * 0.45);
             imgs.forEach(img => {
               const natW = img.naturalWidth;
@@ -759,10 +1000,9 @@
 
             if (isCanvasBlank(canvas)) continue;
 
-            // Consistent generous top margin on EVERY page (first page of section + continuation pages)
-            const topPadFirst = 24;  // adds 12px on top of the 60px body padding = 72px total top margin
-            const topPadNext = 124;  // 62px top margin on continuation pages
-            const bottomPad = 84;    // 42px bottom margin
+            const topPadFirst = 24;
+            const topPadNext = 124;
+            const bottomPad = 84;
             let offsetY = 0;
 
             while (offsetY < canvas.height) {
