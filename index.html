@@ -1,0 +1,824 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>EPUB Reader & PDF Exporter</title>
+  <!-- JSZip & epub.js -->
+  <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/epubjs@0.3.93/dist/epub.min.js"></script>
+  <!-- html2canvas & jsPDF for direct 1-click PDF download -->
+  <script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
+  <style>
+    :root {
+      --bg: #f8f9fa;
+      --surface: #ffffff;
+      --text: #1f2937;
+      --border: #e5e7eb;
+      --primary: #2563eb;
+      --primary-hover: #1d4ed8;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      overflow: hidden;
+    }
+
+    /* Top Toolbar */
+    header {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 0.75rem 1.25rem;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 1rem;
+      flex-wrap: wrap;
+      z-index: 10;
+    }
+    .brand { font-weight: 700; font-size: 1.1rem; display: flex; align-items: center; gap: 0.5rem; }
+    .controls { display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap; }
+    button, .file-label {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      padding: 0.45rem 0.9rem;
+      border-radius: 6px;
+      font-size: 0.875rem;
+      cursor: pointer;
+      font-weight: 500;
+      transition: 0.15s;
+    }
+    button:hover, .file-label:hover { background: #f3f4f6; }
+    button.primary {
+      background: var(--primary);
+      color: #fff;
+      border-color: var(--primary);
+    }
+    button.primary:hover { background: var(--primary-hover); }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    input[type="file"] { display: none; }
+
+    /* Main Layout */
+    main {
+      display: flex;
+      flex: 1;
+      overflow: hidden;
+      position: relative;
+    }
+    aside {
+      width: 280px;
+      background: var(--surface);
+      border-right: 1px solid var(--border);
+      overflow-y: auto;
+      padding: 1rem;
+    }
+    aside.hidden { display: none; }
+    aside h3 { font-size: 0.85rem; text-transform: uppercase; color: #6b7280; margin-bottom: 0.75rem; }
+    #tocList { list-style: none; }
+    #tocList li { margin-bottom: 0.35rem; }
+    #tocList a {
+      text-decoration: none;
+      color: var(--text);
+      font-size: 0.9rem;
+      display: block;
+      padding: 0.35rem 0.5rem;
+      border-radius: 4px;
+    }
+    #tocList a:hover { background: #eff6ff; color: var(--primary); }
+
+    /* Reader Area */
+    #readerWrapper {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      position: relative;
+      background: var(--surface);
+    }
+    #viewer {
+      flex: 1;
+      width: 100%;
+      overflow: hidden;
+      padding: 0 2rem;
+    }
+    #emptyState {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 1rem;
+      color: #6b7280;
+      text-align: center;
+      padding: 2rem;
+    }
+
+    /* Bottom Navigation Bar */
+    footer {
+      background: var(--surface);
+      border-top: 1px solid var(--border);
+      padding: 0.6rem 1.25rem;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      z-index: 10;
+    }
+    #status { font-size: 0.85rem; color: #6b7280; font-weight: 500; }
+
+    /* Export Overlay */
+    #exportOverlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(17, 24, 39, 0.88);
+      display: none;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      z-index: 9999;
+      color: #fff;
+      gap: 0.75rem;
+    }
+    #exportOverlay.active { display: flex; }
+    .progress-bar {
+      width: 320px;
+      height: 8px;
+      background: rgba(255,255,255,0.2);
+      border-radius: 99px;
+      overflow: hidden;
+    }
+    #progressFill {
+      width: 0%;
+      height: 100%;
+      background: #3b82f6;
+      transition: width 0.2s;
+    }
+
+    /* Staging Container */
+    #pdfStage {
+      position: fixed;
+      top: 0;
+      left: 0;
+      background: #ffffff;
+      z-index: 9990;
+      pointer-events: none;
+      opacity: 0;
+      overflow: hidden;
+    }
+    #pdfStage.rendering {
+      opacity: 1;
+    }
+  </style>
+</head>
+<body>
+
+  <header>
+    <div class="brand">
+      <button id="toggleToc" title="Toggle Table of Contents">☰</button>
+      <span id="bookTitle">EPUB Reader</span>
+    </div>
+    <div class="controls">
+      <label class="file-label" for="fileInput">📂 Open .EPUB</label>
+      <input type="file" id="fileInput" accept=".epub" />
+
+      <button id="fontDown" disabled title="Decrease Font Size">A-</button>
+      <button id="fontUp" disabled title="Increase Font Size">A+</button>
+
+      <button id="downloadPdfBtn" class="primary" disabled>⬇ Download PDF</button>
+    </div>
+  </header>
+
+  <main>
+    <aside id="sidebar">
+      <h3>Table of Contents</h3>
+      <ul id="tocList">
+        <li style="color:#9ca3af; font-size:0.85rem;">Load an EPUB to view chapters</li>
+      </ul>
+    </aside>
+
+    <div id="readerWrapper">
+      <div id="emptyState">
+        <h2>No Book Loaded</h2>
+        <p>Click <strong>"Open .EPUB"</strong> above to view your book locally in the browser.</p>
+      </div>
+      <div id="viewer"></div>
+    </div>
+  </main>
+
+  <footer>
+    <button id="prevBtn" disabled>← Previous</button>
+    <span id="status">Ready</span>
+    <button id="nextBtn" disabled>Next →</button>
+  </footer>
+
+  <!-- Staging container & progress modal -->
+  <div id="pdfStage"></div>
+  <div id="exportOverlay">
+    <h3 id="exportStep">Preparing PDF...</h3>
+    <div class="progress-bar"><div id="progressFill"></div></div>
+    <p style="font-size: 0.85rem; opacity: 0.85;">Generating your PDF document...</p>
+  </div>
+
+  <script>
+    let book = null;
+    let rendition = null;
+    let currentBookBuffer = null;
+    let fontSize = 100;
+
+    const fileInput = document.getElementById('fileInput');
+    const viewer = document.getElementById('viewer');
+    const emptyState = document.getElementById('emptyState');
+    const tocList = document.getElementById('tocList');
+    const bookTitleEl = document.getElementById('bookTitle');
+    const statusEl = document.getElementById('status');
+
+    const prevBtn = document.getElementById('prevBtn');
+    const nextBtn = document.getElementById('nextBtn');
+    const fontUp = document.getElementById('fontUp');
+    const fontDown = document.getElementById('fontDown');
+    const downloadPdfBtn = document.getElementById('downloadPdfBtn');
+
+    const exportOverlay = document.getElementById('exportOverlay');
+    const exportStep = document.getElementById('exportStep');
+    const progressFill = document.getElementById('progressFill');
+    const pdfStage = document.getElementById('pdfStage');
+
+    document.getElementById('toggleToc').addEventListener('click', () => {
+      document.getElementById('sidebar').classList.toggle('hidden');
+      if (rendition) rendition.resize();
+    });
+
+    fileInput.addEventListener('change', (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+
+      const reader = new FileReader();
+      reader.onload = (event) => {
+        currentBookBuffer = event.target.result;
+        loadBook(currentBookBuffer, file.name);
+      };
+      reader.readAsArrayBuffer(file);
+    });
+
+    // OPTIONAL: Auto-load a book hosted in your GitHub repo
+    // window.addEventListener('DOMContentLoaded', async () => {
+    //   const res = await fetch('./my-book.epub');
+    //   currentBookBuffer = await res.arrayBuffer();
+    //   loadBook(currentBookBuffer, 'my-book.epub');
+    // });
+
+    function loadBook(bookData, fileName) {
+      if (book) book.destroy();
+      viewer.innerHTML = '';
+      emptyState.style.display = 'none';
+      statusEl.textContent = 'Loading book...';
+
+      book = ePub(bookData);
+      rendition = book.renderTo('viewer', {
+        width: '100%',
+        height: '100%',
+        spread: 'auto'
+      });
+
+      rendition.display();
+
+      [prevBtn, nextBtn, fontUp, fontDown, downloadPdfBtn].forEach(b => b.disabled = false);
+
+      book.loaded.metadata.then((meta) => {
+        bookTitleEl.textContent = meta.title || fileName.replace(/\.epub$/i, '');
+      });
+
+      book.loaded.navigation.then((nav) => {
+        tocList.innerHTML = '';
+        nav.toc.forEach((chapter) => {
+          const li = document.createElement('li');
+          const a = document.createElement('a');
+          a.href = '#';
+          a.textContent = chapter.label.trim();
+          a.onclick = (e) => {
+            e.preventDefault();
+            rendition.display(chapter.href);
+          };
+          li.appendChild(a);
+          tocList.appendChild(li);
+        });
+      });
+
+      rendition.on('relocated', (location) => {
+        const current = location.start.displayed.page;
+        const total = location.start.displayed.total;
+        statusEl.textContent = `Section Page ${current} of ${total}`;
+      });
+    }
+
+    prevBtn.addEventListener('click', () => rendition && rendition.prev());
+    nextBtn.addEventListener('click', () => rendition && rendition.next());
+    document.addEventListener('keyup', (e) => {
+      if (!rendition) return;
+      if (e.key === 'ArrowLeft') rendition.prev();
+      if (e.key === 'ArrowRight') rendition.next();
+    });
+
+    fontUp.addEventListener('click', () => {
+      fontSize += 10;
+      rendition.themes.fontSize(fontSize + '%');
+    });
+    fontDown.addEventListener('click', () => {
+      fontSize = Math.max(60, fontSize - 10);
+      rendition.themes.fontSize(fontSize + '%');
+    });
+
+    function detectFixedDimensions(doc) {
+      const viewportMeta = doc.querySelector('meta[name="viewport"]');
+      if (viewportMeta) {
+        const content = viewportMeta.getAttribute('content') || '';
+        const wMatch = content.match(/width\s*=\s*(\d+)/i);
+        const hMatch = content.match(/height\s*=\s*(\d+)/i);
+        if (wMatch && hMatch) {
+          return {
+            width: parseInt(wMatch[1], 10),
+            height: parseInt(hMatch[1], 10),
+            isFixed: true
+          };
+        }
+      }
+
+      const svg = doc.querySelector('svg[viewBox]');
+      if (svg) {
+        const parts = svg.getAttribute('viewBox').trim().split(/[\s,]+/).map(Number);
+        if (parts.length === 4 && parts[2] > 0 && parts[3] > 0) {
+          return { width: parts[2], height: parts[3], isFixed: true };
+        }
+      }
+
+      return { width: null, height: null, isFixed: false };
+    }
+
+    async function inlineBlobImages(doc) {
+      const imgs = Array.from(doc.querySelectorAll('img'));
+      for (const img of imgs) {
+        if (!img.complete) {
+          await new Promise(res => {
+            img.onload = res;
+            img.onerror = res;
+          });
+        }
+        if (img.src && img.src.startsWith('blob:')) {
+          try {
+            const resp = await fetch(img.src);
+            const blob = await resp.blob();
+            const dataUrl = await new Promise((resolve) => {
+              const reader = new FileReader();
+              reader.onloadend = () => resolve(reader.result);
+              reader.readAsDataURL(blob);
+            });
+            img.src = dataUrl;
+          } catch (e) {
+            console.warn('Blob inline skipped:', e);
+          }
+        }
+      }
+    }
+
+    function isCanvasBlank(canvas) {
+      if (!canvas || canvas.width === 0 || canvas.height === 0) return true;
+      const ctx = canvas.getContext('2d');
+      const data = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+      for (let i = 0; i < data.length; i += 160) {
+        if (data[i] < 252 || data[i + 1] < 252 || data[i + 2] < 252) {
+          return false;
+        }
+      }
+      return true;
+    }
+
+    // Collect exact vertical bounds (in 2x canvas pixels) of all media, headings+next line, and text lines
+    function collectAtomicBoxes(doc, scale = 2) {
+      const boxes = [];
+
+      // 1. Protect images, figures, tables
+      doc.querySelectorAll('img, svg, figure, table').forEach(el => {
+        const target = el.closest('figure') || el;
+        const rect = target.getBoundingClientRect();
+        if (rect.height > 10 && rect.width > 10) {
+          boxes.push({
+            top: Math.max(0, Math.floor((rect.top - 6) * scale)),
+            bottom: Math.ceil((rect.bottom + 6) * scale)
+          });
+        }
+      });
+
+      // 2. Keep every heading attached to the start of its following paragraph/item
+      doc.querySelectorAll('h1, h2, h3, h4, h5, h6').forEach(h => {
+        const hRect = h.getBoundingClientRect();
+        if (hRect.height <= 0) return;
+
+        let nextEl = h.nextElementSibling;
+        while (nextEl && nextEl.getBoundingClientRect().height === 0) {
+          nextEl = nextEl.nextElementSibling;
+        }
+
+        let groupBottom = hRect.bottom;
+        if (nextEl) {
+          const nRect = nextEl.getBoundingClientRect();
+          groupBottom = Math.max(groupBottom, Math.min(nRect.bottom, nRect.top + 55));
+        }
+
+        boxes.push({
+          top: Math.max(0, Math.floor((hRect.top - 4) * scale)),
+          bottom: Math.ceil((groupBottom + 4) * scale)
+        });
+      });
+
+      // 3. Protect every visual line of text (and keep 2-line short paragraphs together)
+      doc.querySelectorAll('p, li, blockquote, dd, dt, h1, h2, h3, h4').forEach(block => {
+        const lineRects = [];
+        const walker = doc.createTreeWalker(block, NodeFilter.SHOW_TEXT, null);
+        let node;
+        while ((node = walker.nextNode())) {
+          if (!node.nodeValue || !node.nodeValue.trim()) continue;
+          const range = doc.createRange();
+          range.selectNodeContents(node);
+          for (const r of range.getClientRects()) {
+            if (r.height > 2 && r.width > 2) {
+              const existing = lineRects.find(lr => Math.abs(lr.top - r.top) < 5);
+              if (existing) {
+                existing.top = Math.min(existing.top, r.top);
+                existing.bottom = Math.max(existing.bottom, r.bottom);
+              } else {
+                lineRects.push({ top: r.top, bottom: r.bottom });
+              }
+            }
+          }
+        }
+
+        lineRects.sort((a, b) => a.top - b.top);
+
+        if (lineRects.length === 2) {
+          boxes.push({
+            top: Math.max(0, Math.floor((lineRects[0].top - 3) * scale)),
+            bottom: Math.ceil((lineRects[1].bottom + 3) * scale)
+          });
+        } else {
+          for (const lr of lineRects) {
+            boxes.push({
+              top: Math.max(0, Math.floor((lr.top - 2) * scale)),
+              bottom: Math.ceil((lr.bottom + 2) * scale)
+            });
+          }
+        }
+      });
+
+      return boxes;
+    }
+
+    function computeCleanCutY(boxes, startY, maxCutY, totalHeight) {
+      if (maxCutY >= totalHeight) return totalHeight;
+
+      let cutY = maxCutY;
+
+      for (let pass = 0; pass < 3; pass++) {
+        for (const box of boxes) {
+          if (box.top < cutY && box.bottom > cutY) {
+            if (box.top > startY + 120) {
+              cutY = box.top - 4;
+            }
+          }
+        }
+      }
+
+      return Math.max(startY + 120, cutY);
+    }
+
+    // Direct 1-click PDF Download
+    downloadPdfBtn.addEventListener('click', async () => {
+      if (!currentBookBuffer) return;
+
+      downloadPdfBtn.disabled = true;
+      exportOverlay.classList.add('active');
+      pdfStage.classList.add('rendering');
+      pdfStage.innerHTML = '';
+
+      const { jsPDF } = window.jspdf;
+      let pdf = null;
+
+      const exportBook = ePub(currentBookBuffer);
+      await exportBook.ready;
+
+      const isPrePaginated = exportBook.package.metadata.layout === 'pre-paginated';
+
+      const REFLOW_W = 600;
+      const REFLOW_H = 848;
+
+      const INIT_W = isPrePaginated ? 800 : REFLOW_W;
+      const INIT_H = isPrePaginated ? 1100 : REFLOW_H;
+
+      pdfStage.style.width = INIT_W + 'px';
+      pdfStage.style.height = INIT_H + 'px';
+
+      const exportRendition = exportBook.renderTo('pdfStage', {
+        width: INIT_W,
+        height: INIT_H,
+        spread: 'none',
+        flow: isPrePaginated ? 'paginated' : 'scrolled-doc',
+        manager: 'default'
+      });
+
+      const effectiveFontSize = isPrePaginated ? fontSize : Math.round(fontSize * 1.3);
+      exportRendition.themes.fontSize(effectiveFontSize + '%');
+
+      const spineItems = exportBook.spine.spineItems;
+      let uniformFixedW = null;
+      let uniformFixedH = null;
+
+      try {
+        for (let i = 0; i < spineItems.length; i++) {
+          const pct = Math.round(((i + 1) / spineItems.length) * 100);
+          exportStep.textContent = `Rendering page ${i + 1} of ${spineItems.length} (${pct}%)`;
+          progressFill.style.width = `${pct}%`;
+
+          await exportRendition.display(spineItems[i].href);
+          await new Promise(r => setTimeout(r, 150));
+
+          let iframe = pdfStage.querySelector('iframe');
+          if (!iframe || !iframe.contentDocument || !iframe.contentDocument.body) continue;
+
+          let doc = iframe.contentDocument;
+          await inlineBlobImages(doc);
+
+          const fixedDims = detectFixedDimensions(doc);
+
+          if (isPrePaginated || fixedDims.isFixed) {
+            if (!uniformFixedW || !uniformFixedH) {
+              uniformFixedW = fixedDims.width || INIT_W;
+              uniformFixedH = fixedDims.height || INIT_H;
+            }
+            const pageW = uniformFixedW;
+            const pageH = uniformFixedH;
+
+            pdfStage.style.width = pageW + 'px';
+            pdfStage.style.height = pageH + 'px';
+            exportRendition.resize(pageW, pageH);
+            await new Promise(r => setTimeout(r, 120));
+
+            iframe = pdfStage.querySelector('iframe');
+            if (!iframe || !iframe.contentDocument || !iframe.contentDocument.body) continue;
+            doc = iframe.contentDocument;
+            await inlineBlobImages(doc);
+            const activeBody = doc.body;
+
+            const canvas = await html2canvas(activeBody, {
+              scale: 2,
+              useCORS: true,
+              allowTaint: true,
+              backgroundColor: '#ffffff',
+              x: 0,
+              y: 0,
+              width: pageW,
+              height: pageH,
+              windowWidth: pageW,
+              windowHeight: pageH
+            });
+
+            if (isCanvasBlank(canvas)) continue;
+
+            const orientation = pageW > pageH ? 'landscape' : 'portrait';
+            if (!pdf) {
+              pdf = new jsPDF({ unit: 'px', format: [pageW, pageH], orientation, hotfixes: ['px_scaling'] });
+            } else {
+              pdf.addPage([pageW, pageH], orientation);
+            }
+
+            pdf.addImage(canvas.toDataURL('image/jpeg', 0.95), 'JPEG', 0, 0, pageW, pageH);
+          } else {
+            // Reflowable chapter book
+            const activeBody = doc.body;
+            const imgs = doc.querySelectorAll('img');
+            const svgs = doc.querySelectorAll('svg');
+            const textLen = (activeBody.innerText || '').trim().length;
+
+            // Detect Cover Page, Title Page graphic, or Back Cover
+            const isFullArtworkPage = ((imgs.length === 1 && svgs.length === 0) || (svgs.length === 1 && imgs.length === 0)) && textLen < 45;
+
+            // Enforce clean margins & normal unbolded body font for hyperlinks via !important stylesheet
+            const overrideStyle = doc.createElement('style');
+            overrideStyle.textContent = `
+              html, body {
+                margin: 0 !important;
+                background: #ffffff !important;
+                box-sizing: border-box !important;
+              }
+              a, a:link, a:visited, a:hover, a:active,
+              a *, a:link *, a:visited * {
+                color: inherit !important;
+                text-decoration: none !important;
+                border-bottom: none !important;
+                background: transparent !important;
+                font-weight: normal !important;
+                font-style: inherit !important;
+              }
+            `;
+            doc.head.appendChild(overrideStyle);
+
+            activeBody.style.width = REFLOW_W + 'px';
+
+            if (isFullArtworkPage) {
+              const pad = 28;
+              const availW = REFLOW_W - pad * 2;
+              const availH = REFLOW_H - pad * 2;
+
+              activeBody.querySelectorAll('div, figure, p, section, span').forEach(el => {
+                el.style.width = 'auto';
+                el.style.height = 'auto';
+                el.style.maxWidth = '100%';
+                el.style.maxHeight = '100%';
+                el.style.margin = '0';
+                el.style.padding = '0';
+                el.style.display = 'flex';
+                el.style.alignItems = 'center';
+                el.style.justifyContent = 'center';
+              });
+
+              activeBody.style.setProperty('padding', pad + 'px', 'important');
+              activeBody.style.height = REFLOW_H + 'px';
+              activeBody.style.display = 'flex';
+              activeBody.style.alignItems = 'center';
+              activeBody.style.justifyContent = 'center';
+
+              if (imgs.length === 1) {
+                const img = imgs[0];
+                const natW = img.naturalWidth || availW;
+                const natH = img.naturalHeight || availH;
+                const ratio = Math.min(availW / natW, availH / natH);
+                const fitW = Math.round(natW * ratio);
+                const fitH = Math.round(natH * ratio);
+
+                img.style.setProperty('width', fitW + 'px', 'important');
+                img.style.setProperty('height', fitH + 'px', 'important');
+                img.style.setProperty('max-width', 'none', 'important');
+                img.style.setProperty('max-height', 'none', 'important');
+              } else if (svgs.length === 1) {
+                const svg = svgs[0];
+                svg.style.setProperty('width', availW + 'px', 'important');
+                svg.style.setProperty('height', availH + 'px', 'important');
+              }
+
+              pdfStage.style.width = REFLOW_W + 'px';
+              pdfStage.style.height = REFLOW_H + 'px';
+              iframe.style.width = REFLOW_W + 'px';
+              iframe.style.height = REFLOW_H + 'px';
+
+              await new Promise(r => requestAnimationFrame(() => setTimeout(r, 50)));
+
+              const canvas = await html2canvas(activeBody, {
+                scale: 2,
+                useCORS: true,
+                allowTaint: true,
+                backgroundColor: '#ffffff',
+                width: REFLOW_W,
+                height: REFLOW_H,
+                windowWidth: REFLOW_W,
+                windowHeight: REFLOW_H
+              });
+
+              if (!isCanvasBlank(canvas)) {
+                if (!pdf) {
+                  pdf = new jsPDF({ unit: 'px', format: [REFLOW_W, REFLOW_H], orientation: 'portrait', hotfixes: ['px_scaling'] });
+                } else {
+                  pdf.addPage([REFLOW_W, REFLOW_H], 'portrait');
+                }
+                pdf.addImage(canvas.toDataURL('image/jpeg', 0.95), 'JPEG', 0, 0, REFLOW_W, REFLOW_H);
+              }
+              continue;
+            }
+
+            // Force generous top, side, and bottom margins with !important so EPUB CSS cannot zero them out
+            const sidePad = 44;
+            const topBodyPad = 60;
+            activeBody.style.setProperty('padding', `${topBodyPad}px ${sidePad}px 48px ${sidePad}px`, 'important');
+            activeBody.style.lineHeight = '1.65';
+            activeBody.style.columnCount = 'auto';
+            activeBody.style.columnWidth = 'auto';
+
+            // Clamp inline & floated images to their container's available width
+            const maxInlineH = Math.round(REFLOW_H * 0.45);
+            imgs.forEach(img => {
+              const natW = img.naturalWidth;
+              const natH = img.naturalHeight;
+              if (natW > 0 && natH > 0) {
+                const imgRect = img.getBoundingClientRect();
+                const parentRect = img.parentElement ? img.parentElement.getBoundingClientRect() : null;
+                const spaceToRightEdge = Math.max(120, (REFLOW_W - sidePad) - Math.max(sidePad, imgRect.left));
+                const parentAvailW = (parentRect && parentRect.width > 40)
+                  ? Math.min(parentRect.width, spaceToRightEdge)
+                  : spaceToRightEdge;
+
+                const computedW = imgRect.width;
+                let targetW = (!img.getAttribute('width') && !img.style.width && natW < parentAvailW)
+                  ? natW
+                  : (computedW > 0 ? Math.min(computedW, parentAvailW) : Math.min(natW, parentAvailW));
+                let targetH = Math.round((targetW * natH) / natW);
+
+                if (targetH > maxInlineH) {
+                  targetH = maxInlineH;
+                  targetW = Math.round((targetH * natW) / natH);
+                }
+
+                img.style.setProperty('width', Math.round(targetW) + 'px', 'important');
+                img.style.setProperty('height', Math.round(targetH) + 'px', 'important');
+                img.style.setProperty('max-width', '100%', 'important');
+                img.style.setProperty('max-height', 'none', 'important');
+              }
+            });
+
+            await new Promise(r => requestAnimationFrame(() => setTimeout(r, 60)));
+
+            const fullH = Math.max(activeBody.scrollHeight, doc.documentElement.scrollHeight, 100);
+            pdfStage.style.width = REFLOW_W + 'px';
+            pdfStage.style.height = fullH + 'px';
+            iframe.style.width = REFLOW_W + 'px';
+            iframe.style.height = fullH + 'px';
+
+            const atomicBoxes = collectAtomicBoxes(doc, 2);
+
+            const canvas = await html2canvas(activeBody, {
+              scale: 2,
+              useCORS: true,
+              allowTaint: true,
+              backgroundColor: '#ffffff',
+              width: REFLOW_W,
+              height: fullH,
+              windowWidth: REFLOW_W,
+              windowHeight: fullH
+            });
+
+            if (isCanvasBlank(canvas)) continue;
+
+            // Consistent generous top margin on EVERY page (first page of section + continuation pages)
+            const topPadFirst = 24;  // adds 12px on top of the 60px body padding = 72px total top margin
+            const topPadNext = 124;  // 62px top margin on continuation pages
+            const bottomPad = 84;    // 42px bottom margin
+            let offsetY = 0;
+
+            while (offsetY < canvas.height) {
+              const topPad = offsetY === 0 ? topPadFirst : topPadNext;
+              const usableSliceH = (REFLOW_H * 2) - topPad - bottomPad;
+              const rawMaxY = Math.min(offsetY + usableSliceH, canvas.height);
+
+              const nextY = computeCleanCutY(atomicBoxes, offsetY, rawMaxY, canvas.height);
+              const hPx = nextY - offsetY;
+              if (hPx < 25) break;
+
+              const pageCanvas = document.createElement('canvas');
+              pageCanvas.width = REFLOW_W * 2;
+              pageCanvas.height = REFLOW_H * 2;
+              const ctx = pageCanvas.getContext('2d');
+              ctx.fillStyle = '#ffffff';
+              ctx.fillRect(0, 0, pageCanvas.width, pageCanvas.height);
+
+              ctx.drawImage(canvas, 0, offsetY, canvas.width, hPx, 0, topPad, canvas.width, hPx);
+
+              if (!isCanvasBlank(pageCanvas)) {
+                if (!pdf) {
+                  pdf = new jsPDF({ unit: 'px', format: [REFLOW_W, REFLOW_H], orientation: 'portrait', hotfixes: ['px_scaling'] });
+                } else {
+                  pdf.addPage([REFLOW_W, REFLOW_H], 'portrait');
+                }
+                pdf.addImage(pageCanvas.toDataURL('image/jpeg', 0.95), 'JPEG', 0, 0, REFLOW_W, REFLOW_H);
+              }
+
+              offsetY = nextY;
+            }
+          }
+        }
+
+        if (pdf) {
+          exportStep.textContent = 'Saving PDF file...';
+          const safeTitle = (bookTitleEl.textContent || 'book').replace(/[^a-z0-9_\-\s]/gi, '').trim() || 'book';
+          pdf.save(`${safeTitle}.pdf`);
+          statusEl.textContent = `Downloaded "${safeTitle}.pdf"`;
+        } else {
+          statusEl.textContent = 'No printable content found in EPUB.';
+        }
+      } catch (err) {
+        console.error('PDF Export Error:', err);
+        statusEl.textContent = `Error generating PDF: ${err.message || err}`;
+      } finally {
+        exportBook.destroy();
+        pdfStage.classList.remove('rendering');
+        pdfStage.innerHTML = '';
+        pdfStage.style.width = '';
+        pdfStage.style.height = '';
+        exportOverlay.classList.remove('active');
+        progressFill.style.width = '0%';
+        downloadPdfBtn.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>
